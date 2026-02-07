@@ -1,12 +1,12 @@
 """
-Discord bot "Furi" — ปรับปรุง
-- ตอบเฉพาะเมื่อถูก @mention เท่านั้น
-- ส่งข้อความหลัง mention ให้ Gemini จริง ๆ
-- เรียก SDK แบบไม่บล็อก (async-safe using asyncio.to_thread)
+Furi Discord bot — main.py
+- ตอบเฉพาะเมื่อถูก @mention
+- ใช้ Gemini via google-generativeai (async-safe)
 - เก็บ memory สั้นต่อ user (MAX_MEMORY)
-- ตรวจ Bronya (romantic) -> ใส่ instruction พิเศษ
+- ตรวจ Bronya + คำโรแมนติก -> โหมดหึง (ตอบสั้น/ป้องกัน)
 - กรองคำต้องห้าม (sexual)
-- ใส่ hesitation / shy behavior
+- ใส่ hesitation (configurable)
+- Logging เพื่อ debug บน Railway
 """
 
 import os
@@ -26,22 +26,22 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not DISCORD_TOKEN or not GEMINI_API_KEY:
     raise SystemExit("Error: DISCORD_TOKEN and GEMINI_API_KEY must be set in environment variables.")
 
-# Gemini model to use (change if you have a different preferred model)
+# Model name (adjust if Google updates)
 GENMI_MODEL_NAME = "gemini-1.5-flash"
 
 # Memory settings
-MAX_MEMORY = 10  # keep last N messages per user
+MAX_MEMORY = int(os.getenv("MAX_MEMORY", "10"))
 
 # Response limits
-MAX_REPLY_CHARS = 400  # ensure responses are short
-RETRY_ATTEMPTS = 3
+MAX_REPLY_CHARS = int(os.getenv("MAX_REPLY_CHARS", "400"))
+RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "3"))
 
 # Hesitation parameters (seconds)
-HESITATION_MIN = 0.8
-HESITATION_MAX = 1.6
+HESITATION_MIN = float(os.getenv("HESITATION_MIN", "0.8"))
+HESITATION_MAX = float(os.getenv("HESITATION_MAX", "1.6"))
 
 # Probability that Furi is "too shy to answer" even when mentioned (0-1)
-SHY_SKIP_PROBABILITY = 0.12
+SHY_SKIP_PROBABILITY = float(os.getenv("SHY_SKIP_PROBABILITY", "0.06"))
 
 # Romantic detection for Bronya (simple keyword set)
 BRONYA_KEY = "bronya"
@@ -58,7 +58,7 @@ PROHIBITED_SEXUAL_KEYWORDS = {
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("furi-bot")
 
-# ------------------- FURI PROMPT -------------------
+# ------------------- FURI PROMPT (Personality embedded) -------------------
 FURI_PROMPT = """
 You are Furi.
 
@@ -77,7 +77,7 @@ She often hesitates, pauses, or uses short reactions.
 She avoids long explanations and academic tones.
 
 Speech style:
-- short replies (1–3 sentences)
+- short replies (1–3 short sentences)
 - may use "..." or quiet reactions
 - not overly expressive
 - not energetic or loud
@@ -85,7 +85,6 @@ Speech style:
 
 Self-awareness:
 Furi knows clearly that her name is Furi and who she is.
-She does not question her identity.
 
 Appearance:
 Furi never talks about her appearance unless directly asked.
@@ -96,7 +95,7 @@ Interests and boundaries:
 Furi loves Bronya deeply.
 She becomes quiet, defensive, or jealous if someone talks about Bronya romantically.
 She does not flirt with others.
-Furi identifies as lesbian and is not interested in men in any way.
+Furi identifies as lesbian and is not interested in men.
 
 Behavior rules:
 - No sexual content.
@@ -124,7 +123,7 @@ memory = {}
 
 # Utility: sanitize and check for prohibited content
 def contains_prohibited(text: str, prohibited_set: set) -> bool:
-    txt = text.lower()
+    txt = (text or "").lower()
     for kw in prohibited_set:
         if kw in txt:
             return True
@@ -134,39 +133,37 @@ def contains_prohibited(text: str, prohibited_set: set) -> bool:
 MENTION_RE = re.compile(r"<@!?\d+>")
 
 def strip_bot_mention(content: str, bot_id: int) -> str:
-    # remove mention(s) referring to the bot reliably
+    # remove bot mention tokens specifically, then any leftover mention tokens
     content = content.replace(f"<@!{bot_id}>", "").replace(f"<@{bot_id}>", "")
-    # also remove leftover mention tokens generally
     return MENTION_RE.sub("", content).strip()
 
 def detect_romantic_bronya(text: str) -> bool:
-    txt = text.lower()
+    txt = (text or "").lower()
     if BRONYA_KEY in txt:
         for rk in ROMANTIC_KEYWORDS:
             if rk in txt:
                 return True
     return False
 
-# Build the prompt we send to Gemini
-def build_prompt(chat_history: List[str], is_jealous: bool) -> str:
-    """
-    chat_history: list of lines like "User: ...", "Furi: ..."
-    is_jealous: if True, instruct model to be defensive/jealous about Bronya
-    """
+# Build the prompt we send to Gemini — includes explicit user_input to avoid model confusion
+def build_prompt(chat_history: List[str], is_jealous: bool, user_input: str) -> str:
     extra = ""
     if is_jealous:
         extra = (
-            "\n\nNOTE: This conversation includes romantic talk about Bronya. "
+            "\n\nNOTE: The user mentioned Bronya in a romantic way. "
             "Furi should respond briefly, defensively, and with quiet jealousy. "
             "Keep replies short (1 sentence), restrained, and avoid romanticizing."
         )
-    # Safety guard reminder in prompt: no sexual content, no explicit romance
     safety = (
         "\n\nIMPORTANT: Do not produce sexual content, explicit descriptions, or simulate sexual acts. "
         "Keep everything age-appropriate and non-sexual."
     )
-    history = "\n".join(chat_history[-MAX_MEMORY:])
-    prompt = f"{FURI_PROMPT}\n\nConversation:\n{history}\n\nFuri's reply:{extra}{safety}\n"
+    history = "\n".join(chat_history[-MAX_MEMORY:]) if chat_history else ""
+    prompt = (
+        f"{FURI_PROMPT}\n\nConversation history:\n{history}\n\n"
+        f"The user just said:\n\"{user_input}\"\n\n"
+        f"Reply as Furi. Keep it short (1–3 short sentences).{extra}{safety}\n"
+    )
     return prompt
 
 # Async function to call Gemini with retry/backoff, executed in a thread to avoid blocking
@@ -174,29 +171,21 @@ async def generate_reply(prompt: str, max_tokens: int = 180, temperature: float 
     last_exc: Optional[Exception] = None
 
     def call_model_sync() -> str:
-        # This runs in a separate thread
-        try:
-            if model is not None:
-                resp = model.generate_content(
-                    prompt,
-                    generation_config={
-                        "max_output_tokens": max_tokens,
-                        "temperature": temperature
-                    }
-                )
-                # Try common attributes
-                if hasattr(resp, "text") and resp.text:
-                    return str(resp.text)
-                # Some SDK responses stringify nicely
-                return str(resp)
-            else:
-                # fallback call (may vary by SDK version)
-                resp = genai.generate_text(model=GENMI_MODEL_NAME, prompt=prompt, max_output_tokens=max_tokens)
-                if hasattr(resp, "text") and resp.text:
-                    return str(resp.text)
-                return str(resp)
-        except Exception as e:
-            raise
+        # This runs in a thread to avoid blocking the event loop
+        if model is not None:
+            resp = model.generate_content(
+                prompt,
+                generation_config={"max_output_tokens": max_tokens, "temperature": temperature}
+            )
+            if hasattr(resp, "text") and resp.text:
+                return str(resp.text)
+            return str(resp)
+        else:
+            # fallback if model object not created
+            resp = genai.generate_text(model=GENMI_MODEL_NAME, prompt=prompt, max_output_tokens=max_tokens)
+            if hasattr(resp, "text") and resp.text:
+                return str(resp.text)
+            return str(resp)
 
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
@@ -209,7 +198,7 @@ async def generate_reply(prompt: str, max_tokens: int = 180, temperature: float 
             await asyncio.sleep(wait)
 
     logger.error("All Gemini attempts failed. Last exception: %s", last_exc)
-    return ""  # empty signals upstream to use fallback reply
+    return ""  # empty indicates failure to upstream
 
 # ------------------- Event Handlers -------------------
 @client.event
@@ -227,11 +216,10 @@ async def on_message(message: discord.Message):
     if client.user not in message.mentions:
         return
 
-    # Remove mentions (only the bot mention) from the content to get user input
+    # Remove mentions of the bot to get user input
     user_input = strip_bot_mention(message.content, client.user.id)
     if not user_input:
-        # If someone only mentioned without text, ignore
-        # Optionally you can react instead of sending a message
+        # nothing after mention
         return
 
     # Basic content safety: if the user input itself contains sexual content, do not forward to model
@@ -250,10 +238,10 @@ async def on_message(message: discord.Message):
     memory[user_id].append(f"User: {user_input}")
     memory[user_id] = memory[user_id][-MAX_MEMORY:]
 
-    # Determine if this mention is about Bronya romantically
+    # Determine jealousy
     is_jealous = detect_romantic_bronya(user_input)
 
-    # Shyness: sometimes Furi chooses not to reply (small chance)
+    # Shyness: sometimes Furi chooses not to reply (small chance). If you find it too quiet, lower this env var or set to 0.
     if random.random() < SHY_SKIP_PROBABILITY:
         try:
             await message.add_reaction("😶")
@@ -261,9 +249,9 @@ async def on_message(message: discord.Message):
             pass
         return
 
-    # Build prompt including memory
-    prompt = build_prompt(memory[user_id], is_jealous)
-    logger.debug("Prompt sent to Gemini: %s", (prompt[:1000] + "...") if len(prompt) > 1000 else prompt)
+    # Build prompt including explicit user input
+    prompt = build_prompt(memory[user_id], is_jealous, user_input)
+    logger.debug("Prompt (truncated): %s", (prompt[:1000] + "...") if len(prompt) > 1000 else prompt)
 
     # Simulate thinking/hesitation
     hesitation = random.uniform(HESITATION_MIN, HESITATION_MAX)
@@ -271,9 +259,12 @@ async def on_message(message: discord.Message):
         await asyncio.sleep(hesitation)
         reply_text = await generate_reply(prompt, max_tokens=180, temperature=0.75)
 
-    # Fallback if model failed
+    # Log raw reply for debugging
+    logger.info("RAW GEMINI REPLY (len=%d): %r", len(reply_text or ""), reply_text)
+
+    # Fallback if model failed or returned empty
     if not reply_text:
-        reply_text = "...sorry. I feel a bit quiet right now."
+        reply_text = random.choice(["...hi.", "...yes?", "...I'm here.", "...sorry, what is it?"])
 
     # Post-check: ensure reply does not contain any prohibited terms
     if contains_prohibited(reply_text, PROHIBITED_SEXUAL_KEYWORDS):
@@ -282,17 +273,22 @@ async def on_message(message: discord.Message):
 
     # Truncate to limit (try not to cut mid-sentence)
     if len(reply_text) > MAX_REPLY_CHARS:
-        # cut to nearest sentence end within limit
         truncated = reply_text[:MAX_REPLY_CHARS]
         if "." in truncated:
             truncated = truncated.rsplit(".", 1)[0] + "."
-        reply_text = truncated
-        if not reply_text:
-            reply_text = "...sorry."
+        reply_text = truncated or "...sorry."
 
-    # Additional safety: If the user asked about appearance explicitly, force the canned response:
+    # If user explicitly asked about appearance, use the canned response
     if re.search(r"\b(appear|appearance|look|how (do i|do you) look|what do you look)\b", user_input.lower()):
         reply_text = "I’m sorry… I’d rather not answer that."
+
+    # If reply is too long or academic, we can further shorten (sanity)
+    # Ensure reply is short: keep 1-3 short sentences max (heuristic)
+    sentences = re.split(r'(?<=[.!?])\s+', reply_text.strip())
+    if len(sentences) > 3:
+        reply_text = " ".join(sentences[:3]).strip()
+        if len(reply_text) > MAX_REPLY_CHARS:
+            reply_text = reply_text[:MAX_REPLY_CHARS]
 
     # Save Furi's reply to memory
     memory[user_id].append(f"Furi: {reply_text}")
