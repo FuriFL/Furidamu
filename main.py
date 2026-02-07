@@ -256,14 +256,6 @@ async def on_message(message: discord.Message):
         # Detect romantic Bronya mentions
         jealous = detect_romantic_bronya(user_input)
 
-        # Optional shy skip (small chance)
-        if random.random() < SHY_SKIP_PROBABILITY:
-            try:
-                await message.add_reaction("😶")
-            except Exception:
-                pass
-            return
-
         # Build prompt and call Gemini
         prompt = build_prompt(memory[uid], jealous, user_input)
         logger.debug("Sending prompt (truncated): %s", (prompt[:800] + "...") if len(prompt) > 800 else prompt)
