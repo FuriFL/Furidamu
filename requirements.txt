@@ -1,2 +1,2 @@
-discord.py==2.3.4
-google-generativeai==0.15.1
+discord.py
+google-generativeai
