@@ -1,11 +1,12 @@
 """
-Discord bot "Furi"
+Discord bot "Furi" — ปรับปรุง
 - ตอบเฉพาะเมื่อถูก @mention เท่านั้น
-- ใช้ Gemini via google-generativeai
+- ส่งข้อความหลัง mention ให้ Gemini จริง ๆ
+- เรียก SDK แบบไม่บล็อก (async-safe using asyncio.to_thread)
 - เก็บ memory สั้นต่อ user (MAX_MEMORY)
-- มี logic ตรวจคำพูดเกี่ยวกับ "Bronya" และคำโรแมนติก -> โหมดหึง (ตอบสั้น/ป้องกัน)
-- ป้องกันข้อความที่เป็นเนื้อหาไม่เหมาะสม (sexual)
-- ใส่ hesitation เพื่อให้รู้สึกเป็นคนจริง ๆ
+- ตรวจ Bronya (romantic) -> ใส่ instruction พิเศษ
+- กรองคำต้องห้าม (sexual)
+- ใส่ hesitation / shy behavior
 """
 
 import os
@@ -13,7 +14,7 @@ import re
 import asyncio
 import random
 import logging
-from typing import List
+from typing import List, Optional
 
 import discord
 import google.generativeai as genai
@@ -111,7 +112,6 @@ try:
     model = genai.GenerativeModel(GENMI_MODEL_NAME)
 except Exception as e:
     logger.warning("Could not initialize GenerativeModel with name '%s'. Error: %s", GENMI_MODEL_NAME, e)
-    # Fall back to a generic interface if needed; still keep genai configured.
     model = None
 
 # ------------------- Discord Setup -------------------
@@ -133,9 +133,11 @@ def contains_prohibited(text: str, prohibited_set: set) -> bool:
 # Utility: clean mention tokens like <@1234567890> or <@!1234567890>
 MENTION_RE = re.compile(r"<@!?\d+>")
 
-def strip_mentions(text: str) -> str:
-    # Remove mention tokens
-    return MENTION_RE.sub("", text).strip()
+def strip_bot_mention(content: str, bot_id: int) -> str:
+    # remove mention(s) referring to the bot reliably
+    content = content.replace(f"<@!{bot_id}>", "").replace(f"<@{bot_id}>", "")
+    # also remove leftover mention tokens generally
+    return MENTION_RE.sub("", content).strip()
 
 def detect_romantic_bronya(text: str) -> bool:
     txt = text.lower()
@@ -167,33 +169,45 @@ def build_prompt(chat_history: List[str], is_jealous: bool) -> str:
     prompt = f"{FURI_PROMPT}\n\nConversation:\n{history}\n\nFuri's reply:{extra}{safety}\n"
     return prompt
 
-# Async function to call Gemini with retry/backoff
+# Async function to call Gemini with retry/backoff, executed in a thread to avoid blocking
 async def generate_reply(prompt: str, max_tokens: int = 180, temperature: float = 0.8) -> str:
-    last_exc = None
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
+    last_exc: Optional[Exception] = None
+
+    def call_model_sync() -> str:
+        # This runs in a separate thread
         try:
             if model is not None:
-                # Using the simple generate_content interface if available
-                response = model.generate_content(
+                resp = model.generate_content(
                     prompt,
                     generation_config={
                         "max_output_tokens": max_tokens,
                         "temperature": temperature
                     }
                 )
-                # Some SDKs return text in different attributes; using .text if present
-                reply_text = getattr(response, "text", None) or str(response)
+                # Try common attributes
+                if hasattr(resp, "text") and resp.text:
+                    return str(resp.text)
+                # Some SDK responses stringify nicely
+                return str(resp)
             else:
-                # If model object wasn't created, fallback to genai.chat.create style call
-                response = genai.generate_text(model=GENMI_MODEL_NAME, prompt=prompt, max_output_tokens=max_tokens)
-                reply_text = response.text if hasattr(response, "text") else str(response)
-            # Ensure string
-            return str(reply_text).strip()
+                # fallback call (may vary by SDK version)
+                resp = genai.generate_text(model=GENMI_MODEL_NAME, prompt=prompt, max_output_tokens=max_tokens)
+                if hasattr(resp, "text") and resp.text:
+                    return str(resp.text)
+                return str(resp)
+        except Exception as e:
+            raise
+
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            reply_text = await asyncio.to_thread(call_model_sync)
+            return reply_text.strip()
         except Exception as exc:
             last_exc = exc
             wait = 1.0 * attempt
             logger.warning("Gemini generate attempt %s failed: %s — retrying in %.1fs", attempt, exc, wait)
             await asyncio.sleep(wait)
+
     logger.error("All Gemini attempts failed. Last exception: %s", last_exc)
     return ""  # empty signals upstream to use fallback reply
 
@@ -213,15 +227,19 @@ async def on_message(message: discord.Message):
     if client.user not in message.mentions:
         return
 
-    # Remove mentions from the content to get user input
-    user_input = strip_mentions(message.content)
+    # Remove mentions (only the bot mention) from the content to get user input
+    user_input = strip_bot_mention(message.content, client.user.id)
     if not user_input:
-        # If someone only mentioned without text, optionally ignore
+        # If someone only mentioned without text, ignore
+        # Optionally you can react instead of sending a message
         return
 
     # Basic content safety: if the user input itself contains sexual content, do not forward to model
     if contains_prohibited(user_input, PROHIBITED_SEXUAL_KEYWORDS):
-        await message.channel.send("...sorry. I can't talk about that.")
+        try:
+            await message.channel.send("...sorry. I can't talk about that.")
+        except Exception:
+            logger.exception("Failed to send safety message.")
         return
 
     user_id = str(message.author.id)
@@ -237,8 +255,6 @@ async def on_message(message: discord.Message):
 
     # Shyness: sometimes Furi chooses not to reply (small chance)
     if random.random() < SHY_SKIP_PROBABILITY:
-        # Option: send a very short hesitant reaction or send nothing.
-        # We'll send a very quiet ellipsis to indicate shyness.
         try:
             await message.add_reaction("😶")
         except Exception:
@@ -247,13 +263,12 @@ async def on_message(message: discord.Message):
 
     # Build prompt including memory
     prompt = build_prompt(memory[user_id], is_jealous)
+    logger.debug("Prompt sent to Gemini: %s", (prompt[:1000] + "...") if len(prompt) > 1000 else prompt)
 
     # Simulate thinking/hesitation
     hesitation = random.uniform(HESITATION_MIN, HESITATION_MAX)
     async with message.channel.typing():
         await asyncio.sleep(hesitation)
-
-        # Call Gemini
         reply_text = await generate_reply(prompt, max_tokens=180, temperature=0.75)
 
     # Fallback if model failed
@@ -265,10 +280,15 @@ async def on_message(message: discord.Message):
         logger.warning("Generated reply contained prohibited keywords; replacing with safe fallback.")
         reply_text = "...sorry. I can't talk about that."
 
-    # Truncate to limit
+    # Truncate to limit (try not to cut mid-sentence)
     if len(reply_text) > MAX_REPLY_CHARS:
-        reply_text = reply_text[:MAX_REPLY_CHARS].rsplit(".", 1)[0]  # try to cut at sentence end
-        reply_text = (reply_text + "...") if reply_text else "...sorry."
+        # cut to nearest sentence end within limit
+        truncated = reply_text[:MAX_REPLY_CHARS]
+        if "." in truncated:
+            truncated = truncated.rsplit(".", 1)[0] + "."
+        reply_text = truncated
+        if not reply_text:
+            reply_text = "...sorry."
 
     # Additional safety: If the user asked about appearance explicitly, force the canned response:
     if re.search(r"\b(appear|appearance|look|how (do i|do you) look|what do you look)\b", user_input.lower()):
